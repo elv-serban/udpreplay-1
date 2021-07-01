@@ -3,15 +3,18 @@
 
 #include <cstring>
 #include <iostream>
+#include <arpa/inet.h>
 #include <net/ethernet.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/udp.h>
 #include <pcap/pcap.h>
+#include <time.h>
 #include <unistd.h>
 
 #define NANOSECONDS_PER_SECOND 1000000000L
+#define DBG 0
 
 int main(int argc, char *argv[]) {
 
@@ -22,9 +25,12 @@ int main(int argc, char *argv[]) {
   int repeat = 1;
   int ttl = -1;
   int broadcast = 0;
+  char *dst_addr = NULL;
+  short dst_port = 0;
+  int npkts = 0;
 
   int opt;
-  while ((opt = getopt(argc, argv, "i:bls:c:r:t:")) != -1) {
+  while ((opt = getopt(argc, argv, "i:bls:c:r:t:h:p:")) != -1) {
     switch (opt) {
     case 'i':
       ifindex = if_nametoindex(optarg);
@@ -66,6 +72,12 @@ int main(int argc, char *argv[]) {
     case 'b':
       broadcast = 1;
       break;
+    case 'h':
+      dst_addr = strdup(optarg);
+      break;
+    case 'p':
+      dst_port = std::stoi(optarg);
+      break;
     default:
       goto usage;
     }
@@ -76,16 +88,18 @@ int main(int argc, char *argv[]) {
         << "udpreplay 1.0.0 © 2020 Erik Rigtorp <erik@rigtorp.se> "
            "https://github.com/rigtorp/udpreplay\n"
            "usage: udpreplay [-i iface] [-l] [-s speed] [-c millisec] [-r "
-           "repeat] [-t ttl] "
+           "repeat] [-t ttl] [-h host] [-p port]"
            "pcap\n"
            "\n"
            "  -i iface    interface to send packets through\n"
            "  -l          enable loopback\n"
            "  -c millisec constant milliseconds between packets\n"
            "  -r repeat   number of times to loop data (-1 for infinite loop)\n"
-           "  -s speed    replay speed relative to pcap timestamps\n"
+           "  -s speed    replay speed relative to pcap timestamps (0.5 is double speed)\n"
            "  -t ttl      packet ttl\n"
-           "  -b          enable broadcast (SO_BROADCAST)"
+           "  -b          enable broadcast (SO_BROADCAST)\n"
+           "  -h          destination address (optional)\n"
+           "  -p          destination port (optional)\n"
         << std::endl;
     return 1;
   }
@@ -161,6 +175,9 @@ int main(int argc, char *argv[]) {
         pcap_start.tv_nsec =
             header.ts.tv_usec; // Note PCAP_TSTAMP_PRECISION_NANO
       }
+
+      if (DBG >= 2) printf("packet len=%d ts=%ld.%6d\n", header.len, header.ts.tv_sec, header.ts.tv_usec);
+
       if (header.len != header.caplen) {
         continue;
       }
@@ -196,6 +213,7 @@ int main(int argc, char *argv[]) {
         if (speed != 1.0) {
           delta *= speed;
         }
+
         deadline = start;
         deadline.tv_sec += delta / NANOSECONDS_PER_SECOND;
         deadline.tv_nsec += delta % NANOSECONDS_PER_SECOND;
@@ -207,6 +225,8 @@ int main(int argc, char *argv[]) {
         deadline.tv_nsec -= NANOSECONDS_PER_SECOND;
       }
 
+      if (DBG >= 3) printf("send time %lu.%09lu\n", deadline.tv_sec, deadline.tv_nsec);
+
       timespec now = {};
       if (clock_gettime(CLOCK_MONOTONIC, &now) == -1) {
         std::cerr << "clock_gettime: " << strerror(errno) << std::endl;
@@ -215,11 +235,25 @@ int main(int argc, char *argv[]) {
 
       if (deadline.tv_sec > now.tv_sec ||
           (deadline.tv_sec == now.tv_sec && deadline.tv_nsec > now.tv_nsec)) {
+
+#if __APPLE__
+          struct timespec tosleep = {deadline.tv_sec - now.tv_sec, 0};
+          if (deadline.tv_nsec < now.tv_nsec) {
+              tosleep.tv_sec --;
+              tosleep.tv_nsec = NANOSECONDS_PER_SECOND + deadline.tv_nsec - now.tv_nsec;
+          } else {
+              tosleep.tv_nsec = deadline.tv_nsec - now.tv_nsec;
+          }
+
+          if (DBG >= 3) printf("sleep=%ld.%09ld\n", tosleep.tv_sec, tosleep.tv_nsec);
+          nanosleep(&tosleep, NULL);
+#else
         if (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline,
                             nullptr) == -1) {
           std::cerr << "clock_nanosleep: " << strerror(errno) << std::endl;
           return 1;
         }
+#endif
       }
 
 #ifdef __GLIBC__
@@ -233,17 +267,32 @@ int main(int argc, char *argv[]) {
       sockaddr_in addr;
       memset(&addr, 0, sizeof(addr));
       addr.sin_family = AF_INET;
+
+      if (dst_port) {
+        addr.sin_port = htons(dst_port);
+      } else {
 #ifdef __GLIBC__
-      addr.sin_port = udp->dest;
+        addr.sin_port = udp->dest;
 #else
-      addr.sin_port = udp->uh_dport;
+        addr.sin_port = udp->uh_dport;
 #endif
-      addr.sin_addr = {ip->ip_dst};
+      }
+      if (dst_addr) {
+        inet_pton(AF_INET, dst_addr, &(addr.sin_addr));
+      } else {
+        addr.sin_addr = {ip->ip_dst};
+      }
+
+      if (DBG >= 1) printf("sendto %s:%hu len=%d\n", inet_ntoa(addr.sin_addr), ntohs(addr.sin_port), header.len);
       auto n = sendto(fd, d, len, 0, reinterpret_cast<sockaddr *>(&addr),
                       sizeof(addr));
       if (n != len) {
         std::cerr << "sendto: " << strerror(errno) << std::endl;
         return 1;
+      }
+
+      if (npkts ++ % 10000 == 0) {
+          printf("Sent: %d %s:%hu \n", npkts, inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
       }
     }
 
@@ -252,3 +301,4 @@ int main(int argc, char *argv[]) {
 
   return 0;
 }
+
