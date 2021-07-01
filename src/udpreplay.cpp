@@ -176,7 +176,8 @@ int main(int argc, char *argv[]) {
             header.ts.tv_usec; // Note PCAP_TSTAMP_PRECISION_NANO
       }
 
-      if (DBG >= 2) printf("packet len=%d ts=%ld.%6d\n", header.len, header.ts.tv_sec, header.ts.tv_usec);
+      if (DBG >= 2) printf("packet len=%d ts=%ld.%6ld\n",
+          header.len, header.ts.tv_sec, (long)header.ts.tv_usec);
 
       if (header.len != header.caplen) {
         continue;
