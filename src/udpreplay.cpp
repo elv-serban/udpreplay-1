@@ -30,6 +30,14 @@ struct cfg_t {
 struct ctx_t {
     cfg_t *cfg;
     int fd;
+
+    /* Loss and OOO counters */
+    int64_t lossint_count; // packets until next loss
+    int64_t losspkt_count; // packets dropped during this loss event
+    int64_t oooint_count;  // packets until next ooo
+    int64_t ooopkt_count;  // packets buffered during this ooo event
+    int64_t loss_count;    // total packets dropped so far
+    int64_t ooo_count;     // total packets queued for ooo so far
 };
 
 /* A 'packet' */
@@ -45,14 +53,14 @@ pkt_t pktq[1024];
  *
  * Not thread safe (has globals)
  */
-static int pkt_send(ctx_t ctx, pkt_t pkt) {
+static int pkt_send(ctx_t *ctx, pkt_t pkt) {
 
     static int npkts = 0;
 
     if (DBG >= 1) printf("sendto %s:%hu len=%zd\n",
         inet_ntoa(pkt.addr.sin_addr), ntohs(pkt.addr.sin_port), pkt.len);
 
-    auto n = sendto(ctx.fd, pkt.d, pkt.len, 0, reinterpret_cast<sockaddr *>(&pkt.addr),
+    auto n = sendto(ctx->fd, pkt.d, pkt.len, 0, reinterpret_cast<sockaddr *>(&pkt.addr),
                       sizeof(pkt.addr));
     if (n != pkt.len) {
         std::cerr << "sendto: " << strerror(errno) << std::endl;
@@ -70,57 +78,51 @@ static int pkt_send(ctx_t ctx, pkt_t pkt) {
  *
  * Not thread safe (uses globals)
  */
-static int pkt_queue(ctx_t ctx, const u_char *d, ssize_t len, sockaddr_in addr) {
+static int pkt_queue(ctx_t *ctx, const u_char *d, ssize_t len, sockaddr_in addr) {
 
-    cfg_t *cfg = ctx.cfg;
+    cfg_t *cfg = ctx->cfg;
 
     int rc;
     struct pkt_t pkt = {d, len, addr};
 
-    static int64_t lossint_count = cfg->loss_int_sec; // packets until next loss
-    static int64_t losspkt_count = 0;                 // packets dropped during this loss event
-    static int64_t oooint_count = cfg->ooo_int_sec;   // packets until next ooo
-    static int64_t ooopkt_count = 0;                  // packets buffered during this ooo event
-    static int64_t loss_count = 0;                    // total packets dropped so far
-    static int64_t ooo_count = 0;                     // total packets queued for ooo so far
-
     if (cfg->loss_int_sec) {
 
         /* Should drop? */
-        if (-- lossint_count <= 0) {
-            ++ loss_count;
-            ++ losspkt_count;
+        if (-- ctx->lossint_count <= 0) {
+            ++ ctx->loss_count;
+            ++ ctx->losspkt_count;
 
             /* If this is the last packet to drop, restor interval */
-            if (losspkt_count >= cfg->loss_pkts) {
-                lossint_count = cfg->loss_int_sec;
-                losspkt_count = 0;
+            if (ctx->losspkt_count >= cfg->loss_pkts) {
+                ctx->lossint_count = ctx->cfg->loss_int_sec;
+                ctx->losspkt_count = 0;
             }
-            printf("Drop - total=%lld\n", loss_count);
+            printf("Drop - total=%lld\n", ctx->loss_count);
             return 0;
         }
     }
 
     if (cfg->ooo_int_sec) {
-        /* Should queue for OOO? */
-        if (-- oooint_count <= 0) {
-            ++ ooo_count;
-            ++ ooopkt_count;
 
-            pktq[ooopkt_count - 1] = pkt;
-            printf("OOO queue - total=%lld\n", ooo_count);
+        /* Should queue for OOO? */
+        if (-- ctx->oooint_count <= 0) {
+            ++ ctx->ooo_count;
+            ++ ctx->ooopkt_count;
+
+            pktq[ctx->ooopkt_count - 1] = pkt;
+            printf("OOO queue - total=%lld\n", ctx->ooo_count);
 
             /* If this is the last packet to queue, replay all */
-            if (ooopkt_count >= cfg->ooo_pkts) {
-                for (int i = ooopkt_count - 1; i >= 0; i --) {
+            if (ctx->ooopkt_count >= cfg->ooo_pkts) {
+                for (int i = ctx->ooopkt_count - 1; i >= 0; i --) {
                     printf("OOO replay - %d\n", i);
                     rc = pkt_send(ctx, pktq[i]);
                     if (rc < 0) {
                         return rc;
                     }
                 }
-                oooint_count = cfg->ooo_int_sec;
-                ooopkt_count = 0;
+                ctx->oooint_count = cfg->ooo_int_sec;
+                ctx->ooopkt_count = 0;
             }
 
             return 0;
@@ -166,6 +168,12 @@ parse_impairment(cfg_t *pcfg, char* impairment)
 
     if ((size_t)pcfg->ooo_pkts > sizeof(pktq)/sizeof(pkt_t))
         return -1;
+
+    // If both loss and OOO intervals are 0, this is likely not what the user meant
+    // (0's could also be integer parsing failures)
+    if (pcfg->loss_int_sec == 0 && pcfg->ooo_int_sec == 0) {
+        return -1;
+    }
 
     printf("Impairment: loss %lld/%lld ooo %lld/%lld\n",
         pcfg->loss_int_sec, pcfg->loss_pkts, pcfg->ooo_int_sec, pcfg->ooo_pkts);
@@ -326,7 +334,10 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  /* Initialize context */
   ctx.fd = fd;
+  ctx.lossint_count = cfg.loss_int_sec;
+  ctx.oooint_count = cfg.ooo_int_sec;
 
   for (int i = 0; repeat == -1 || i < repeat; i++) {
     char errbuf[PCAP_ERRBUF_SIZE];
@@ -462,7 +473,7 @@ int main(int argc, char *argv[]) {
         addr.sin_addr = {ip->ip_dst};
       }
 
-      int err = pkt_queue(ctx, d, len, addr);
+      int err = pkt_queue(&ctx, d, len, addr);
       if (err < 0) {
           return 1;
       }
