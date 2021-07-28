@@ -12,9 +12,166 @@
 #include <pcap/pcap.h>
 #include <time.h>
 #include <unistd.h>
+#include <string.h>
 
 #define NANOSECONDS_PER_SECOND 1000000000L
 #define DBG 0
+
+/* Command line config */
+struct cfg_t {
+    /* PENDING - not all config is here */
+    int64_t loss_int_sec;  // Interval between loss events (sec; 0 means disabled)
+    int64_t loss_pkts;     // Drop these many packets during one loss event
+    int64_t ooo_int_sec;   // Interval between OOO events (sec; 0 means disabled)
+    int64_t ooo_pkts;      // Queue and reorder these many packets during one OOO event
+};
+
+/* Running context */
+struct ctx_t {
+    cfg_t *cfg;
+    int fd;
+};
+
+/* A 'packet' */
+struct pkt_t {
+    const u_char *d;
+    ssize_t len;
+    sockaddr_in addr;
+};
+
+pkt_t pktq[1024];
+
+/*
+ *
+ * Not thread safe (has globals)
+ */
+static int pkt_send(ctx_t ctx, pkt_t pkt) {
+
+    static int npkts = 0;
+
+    if (DBG >= 1) printf("sendto %s:%hu len=%zd\n",
+        inet_ntoa(pkt.addr.sin_addr), ntohs(pkt.addr.sin_port), pkt.len);
+
+    auto n = sendto(ctx.fd, pkt.d, pkt.len, 0, reinterpret_cast<sockaddr *>(&pkt.addr),
+                      sizeof(pkt.addr));
+    if (n != pkt.len) {
+        std::cerr << "sendto: " << strerror(errno) << std::endl;
+        return -1;
+    }
+
+    if (npkts ++ % 10000 == 0) {
+        printf("Sent: %d %s:%hu \n", npkts, inet_ntoa(pkt.addr.sin_addr), ntohs(pkt.addr.sin_port));
+    }
+
+    return 0;
+}
+
+/*
+ *
+ * Not thread safe (uses globals)
+ */
+static int pkt_queue(ctx_t ctx, const u_char *d, ssize_t len, sockaddr_in addr) {
+
+    cfg_t *cfg = ctx.cfg;
+
+    int rc;
+    struct pkt_t pkt = {d, len, addr};
+
+    static int64_t lossint_count = cfg->loss_int_sec; // packets until next loss
+    static int64_t losspkt_count = 0;                 // packets dropped during this loss event
+    static int64_t oooint_count = cfg->ooo_int_sec;   // packets until next ooo
+    static int64_t ooopkt_count = 0;                  // packets buffered during this ooo event
+    static int64_t loss_count = 0;                    // total packets dropped so far
+    static int64_t ooo_count = 0;                     // total packets queued for ooo so far
+
+    if (cfg->loss_int_sec) {
+
+        /* Should drop? */
+        if (-- lossint_count <= 0) {
+            ++ loss_count;
+            ++ losspkt_count;
+
+            /* If this is the last packet to drop, restor interval */
+            if (losspkt_count >= cfg->loss_pkts) {
+                lossint_count = cfg->loss_int_sec;
+                losspkt_count = 0;
+            }
+            printf("Drop - total=%lld\n", loss_count);
+            return 0;
+        }
+    }
+
+    if (cfg->ooo_int_sec) {
+        /* Should queue for OOO? */
+        if (-- oooint_count <= 0) {
+            ++ ooo_count;
+            ++ ooopkt_count;
+
+            pktq[ooopkt_count - 1] = pkt;
+            printf("OOO queue - total=%lld\n", ooo_count);
+
+            /* If this is the last packet to queue, replay all */
+            if (ooopkt_count >= cfg->ooo_pkts) {
+                for (int i = ooopkt_count - 1; i >= 0; i --) {
+                    printf("OOO replay - %d\n", i);
+                    rc = pkt_send(ctx, pktq[i]);
+                    if (rc < 0) {
+                        return rc;
+                    }
+                }
+                oooint_count = cfg->ooo_int_sec;
+                ooopkt_count = 0;
+            }
+
+            return 0;
+        }
+    }
+
+    /* Send regular packet */
+    rc = pkt_send(ctx, pkt);
+    return rc;
+}
+
+/*
+ * Format - colon separated:  LOSSINT:NLOSS:OOOINT:NOOO
+ * - LOSSINT - loss interval (sec; 0 means disabled)
+ * - NLOSS - number of packets to drop in one loss event
+ * - OOOINT - ooo interval (sec; 0 means disabled)
+ * - NOOO - number of packets to reorder in one ooo event
+ */
+static int
+parse_impairment(cfg_t *pcfg, char* impairment)
+{
+    char *ptr;
+
+    if (!impairment)
+        return 0;
+
+    ptr = strtok(impairment, ":");
+    if (ptr == NULL)
+        return -1;
+    pcfg->loss_int_sec = atoi(ptr);
+    ptr = strtok(NULL, ":");
+    if (ptr == NULL)
+        return -1;
+    pcfg->loss_pkts = atoi(ptr);
+    ptr = strtok(NULL, ":");
+    if (ptr == NULL)
+        return -1;
+    pcfg->ooo_int_sec = atoi(ptr);
+    ptr = strtok(NULL, ":");
+    if (ptr == NULL)
+        return -1;
+    pcfg->ooo_pkts = atoi(ptr);
+
+    if ((size_t)pcfg->ooo_pkts > sizeof(pktq)/sizeof(pkt_t))
+        return -1;
+
+    printf("Impairment: loss %lld/%lld ooo %lld/%lld\n",
+        pcfg->loss_int_sec, pcfg->loss_pkts, pcfg->ooo_int_sec, pcfg->ooo_pkts);
+
+    return 0;
+}
 
 int main(int argc, char *argv[]) {
 
@@ -27,10 +184,18 @@ int main(int argc, char *argv[]) {
   int broadcast = 0;
   char *dst_addr = NULL;
   short dst_port = 0;
-  int npkts = 0;
+  char *impairment = NULL;
+
+  cfg_t cfg;
+  ctx_t ctx;
+
+  memset(&cfg, 0, sizeof(cfg_t));
+  memset(&ctx, 0, sizeof(ctx_t));
+
+  ctx.cfg = &cfg;
 
   int opt;
-  while ((opt = getopt(argc, argv, "i:bls:c:r:t:h:p:")) != -1) {
+  while ((opt = getopt(argc, argv, "i:bls:c:r:t:h:p:m:")) != -1) {
     switch (opt) {
     case 'i':
       ifindex = if_nametoindex(optarg);
@@ -78,6 +243,9 @@ int main(int argc, char *argv[]) {
     case 'p':
       dst_port = std::stoi(optarg);
       break;
+    case 'm':
+      impairment = strdup(optarg);
+      break;
     default:
       goto usage;
     }
@@ -100,8 +268,16 @@ int main(int argc, char *argv[]) {
            "  -b          enable broadcast (SO_BROADCAST)\n"
            "  -h          destination address (optional)\n"
            "  -p          destination port (optional)\n"
+           "  -m          impairment (format: LOSS_INT_SEC:N_LOSS:OOO_INT_SEC:N_OOO)\n"
+           "\n"
+           "Example: ./udpreplay -m 5000:5:8000:8 -h 127.0.0.1 -p 12000 sample.pcap\n"
         << std::endl;
     return 1;
+  }
+
+  if (parse_impairment(&cfg, impairment) < 0) {
+      std::cerr << "bad impairment options: " << impairment << std::endl;
+      return 1;
   }
 
   int fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -149,6 +325,8 @@ int main(int argc, char *argv[]) {
     std::cerr << "clock_gettime: " << strerror(errno) << std::endl;
     return 1;
   }
+
+  ctx.fd = fd;
 
   for (int i = 0; repeat == -1 || i < repeat; i++) {
     char errbuf[PCAP_ERRBUF_SIZE];
@@ -284,16 +462,9 @@ int main(int argc, char *argv[]) {
         addr.sin_addr = {ip->ip_dst};
       }
 
-      if (DBG >= 1) printf("sendto %s:%hu len=%d\n", inet_ntoa(addr.sin_addr), ntohs(addr.sin_port), header.len);
-      auto n = sendto(fd, d, len, 0, reinterpret_cast<sockaddr *>(&addr),
-                      sizeof(addr));
-      if (n != len) {
-        std::cerr << "sendto: " << strerror(errno) << std::endl;
-        return 1;
-      }
-
-      if (npkts ++ % 10000 == 0) {
-          printf("Sent: %d %s:%hu \n", npkts, inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
+      int err = pkt_queue(ctx, d, len, addr);
+      if (err < 0) {
+          return 1;
       }
     }
 
