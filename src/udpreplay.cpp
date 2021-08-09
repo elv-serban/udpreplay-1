@@ -97,7 +97,7 @@ static int pkt_queue(ctx_t *ctx, const u_char *d, ssize_t len, sockaddr_in addr)
                 ctx->lossint_count = ctx->cfg->loss_int_sec;
                 ctx->losspkt_count = 0;
             }
-            printf("Drop - total=%lld\n", ctx->loss_count);
+            std::cout << "Drop - total=" << ctx->loss_count << std::endl;
             return 0;
         }
     }
@@ -110,7 +110,7 @@ static int pkt_queue(ctx_t *ctx, const u_char *d, ssize_t len, sockaddr_in addr)
             ++ ctx->ooopkt_count;
 
             pktq[ctx->ooopkt_count - 1] = pkt;
-            printf("OOO queue - total=%lld\n", ctx->ooo_count);
+            std::cout << "OOO queue - total=" << ctx->ooo_count << std::endl;
 
             /* If this is the last packet to queue, replay all */
             if (ctx->ooopkt_count >= cfg->ooo_pkts) {
@@ -175,8 +175,8 @@ parse_impairment(cfg_t *pcfg, char* impairment)
         return -1;
     }
 
-    printf("Impairment: loss %lld/%lld ooo %lld/%lld\n",
-        pcfg->loss_int_sec, pcfg->loss_pkts, pcfg->ooo_int_sec, pcfg->ooo_pkts);
+    std::cout << "Impairment: loss " << pcfg->loss_int_sec << "/" << pcfg->loss_pkts <<
+	    " ooo " << pcfg->ooo_int_sec << "/" << pcfg->ooo_pkts << std::endl;
 
     return 0;
 }
