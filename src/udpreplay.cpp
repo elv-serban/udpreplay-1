@@ -328,6 +328,12 @@ int main(int argc, char *argv[]) {
     }
   }
 
+  size_t bufsz = 128*1024*1024;
+  if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, (const void *)&bufsz, (socklen_t)sizeof(bufsz)) == -1) {
+      std::cerr << "setsockopt: " << strerror(errno) << std::endl;
+      return 1;
+  }
+
   timespec deadline = {};
   if (clock_gettime(CLOCK_MONOTONIC, &deadline) == -1) {
     std::cerr << "clock_gettime: " << strerror(errno) << std::endl;
@@ -423,6 +429,9 @@ int main(int argc, char *argv[]) {
         return 1;
       }
 
+      if (deadline.tv_sec - now.tv_sec > 1)
+            std::cerr << "** sleeping %lu sec" << deadline.tv_sec - now.tv_sec << std::endl;
+
       if (deadline.tv_sec > now.tv_sec ||
           (deadline.tv_sec == now.tv_sec && deadline.tv_nsec > now.tv_nsec)) {
 
@@ -451,6 +460,9 @@ int main(int argc, char *argv[]) {
 #else
       ssize_t len = ntohs(udp->uh_ulen) - 8;
 #endif
+      if (len <= 0)
+        std::cerr << "Invalid len: " << len << std::endl;
+
       const u_char *d =
           &p[sizeof(ether_header) + ip->ip_hl * 4 + sizeof(udphdr)];
 
