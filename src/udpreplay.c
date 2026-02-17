@@ -15,6 +15,7 @@
 #include <netinet/ip.h>
 #include <netinet/udp.h>
 #include <pcap/pcap.h>
+#include <sys/ioctl.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -211,13 +212,29 @@ int main(int argc, char *argv[]) {
   int opt;
   while ((opt = getopt(argc, argv, "i:bls:c:r:t:h:p:m:")) != -1) {
     switch (opt) {
-    case 'i':
+    case 'i': {
       ifindex = if_nametoindex(optarg);
       if (ifindex == 0) {
         fprintf(stderr, "if_nametoindex: %s\n", strerror(errno));
         return 1;
       }
+      struct ifreq ifr;
+      memset(&ifr, 0, sizeof(ifr));
+      strncpy(ifr.ifr_name, optarg, IFNAMSIZ - 1);
+      int tmpfd = socket(AF_INET, SOCK_DGRAM, 0);
+      if (tmpfd != -1) {
+        if (ioctl(tmpfd, SIOCGIFFLAGS, &ifr) == 0 &&
+            !(ifr.ifr_flags & IFF_MULTICAST)) {
+          fprintf(stderr,
+              "WARNING: interface %s does not have the MULTICAST flag.\n"
+              "Check: ip link show %s"
+              "Fix  : sudo ip link set %s multicast on",
+              optarg, optarg, optarg);
+        }
+        close(tmpfd);
+      }
       break;
+    }
     case 'l':
       loopback = 1;
       break;
