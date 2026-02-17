@@ -227,8 +227,8 @@ int main(int argc, char *argv[]) {
             !(ifr.ifr_flags & IFF_MULTICAST)) {
           fprintf(stderr,
               "WARNING: interface %s does not have the MULTICAST flag.\n"
-              "Check: ip link show %s"
-              "Fix  : sudo ip link set %s multicast on",
+              "Check: ip link show %s\n"
+              "Fix  : sudo ip link set %s multicast on\n",
               optarg, optarg, optarg);
         }
         close(tmpfd);
